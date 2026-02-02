@@ -38,7 +38,7 @@ REVIEW_CHANNEL_ID = int(os.getenv("REVIEW_CHANNEL_ID", 0))
 # Add the Discord User IDs of your experts here.
 EXPERT_IDS = [
     1467844647773802579, 
-    987654321098765432
+    861825627032125491
 ]
 
 STATIC_KNOWLEDGE_BASE = []
@@ -658,4 +658,5 @@ async def main():
 if __name__ == "__main__":
     try: asyncio.run(main())
     except KeyboardInterrupt: pass
+
 
