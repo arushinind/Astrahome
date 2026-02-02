@@ -1,6 +1,6 @@
 import discord
 from discord import app_commands, ui
-from discord.ext import commands
+from discord.ext import commands, tasks
 import logging
 import os
 import asyncio
@@ -33,6 +33,13 @@ MYSTIC_COLOR = 0x9b59b6
 
 DB_NAME = os.getenv("DB_NAME", "astra_home.db")
 REVIEW_CHANNEL_ID = int(os.getenv("REVIEW_CHANNEL_ID", 0))
+
+# --- EXPERT CONFIGURATION ---
+# Add the Discord User IDs of your experts here.
+EXPERT_IDS = [
+    861825627032125491, 
+    1451038995545850054
+]
 
 STATIC_KNOWLEDGE_BASE = []
 
@@ -72,6 +79,7 @@ class DatabaseManager:
             os.makedirs(directory)
 
         async with aiosqlite.connect(self.db_name) as db:
+            # FAQ Table
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS faq (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,14 +91,23 @@ class DatabaseManager:
                     use_count INTEGER DEFAULT 0
                 )
             """)
+            # Users Table (Updated with last_daily)
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id INTEGER PRIMARY KEY,
                     karma INTEGER DEFAULT 0,
                     meditations INTEGER DEFAULT 0,
-                    last_meditation TIMESTAMP
+                    last_meditation TIMESTAMP,
+                    last_daily TIMESTAMP
                 )
             """)
+            
+            # MIGRATION CHECK: Attempt to add columns if they don't exist (for older DB versions)
+            try:
+                await db.execute("ALTER TABLE users ADD COLUMN last_daily TIMESTAMP")
+            except Exception:
+                pass # Column likely exists
+                
             await db.commit()
         logger.info(f"Connected to Database: {self.db_name}")
 
@@ -140,6 +157,27 @@ class DatabaseManager:
                     karma = karma + 10, 
                     meditations = meditations + 1,
                     last_meditation = ?
+            """, (user_id, now, now))
+            await db.commit()
+            return True, None
+
+    async def claim_daily(self, user_id: int):
+        now = datetime.now()
+        async with aiosqlite.connect(self.db_name) as db:
+            async with db.execute("SELECT last_daily FROM users WHERE user_id = ?", (user_id,)) as cursor:
+                row = await cursor.fetchone()
+                if row and row[0]:
+                    last = datetime.fromisoformat(row[0])
+                    if now - last < timedelta(hours=24):
+                        return False, (timedelta(hours=24) - (now - last))
+            
+            # Give 50 Karma for daily
+            await db.execute("""
+                INSERT INTO users (user_id, karma, last_daily) 
+                VALUES (?, 50, ?)
+                ON CONFLICT(user_id) DO UPDATE SET 
+                    karma = karma + 50, 
+                    last_daily = ?
             """, (user_id, now, now))
             await db.commit()
             return True, None
@@ -197,6 +235,10 @@ class AdminReviewView(ui.View):
 
     @ui.button(label="Draft Answer", style=discord.ButtonStyle.primary, emoji="✍️", custom_id="qa_btn_answer")
     async def answer_button(self, interaction: discord.Interaction, button: ui.Button):
+        if interaction.user.id not in EXPERT_IDS:
+            await interaction.response.send_message("🚫 **Access Denied:** Only designated Experts can draft answers.", ephemeral=True)
+            return
+
         embed = interaction.message.embeds[0]
         description = embed.description or ""
         question_text = description.replace("**Inquiry:**\n", "").strip()
@@ -204,6 +246,10 @@ class AdminReviewView(ui.View):
 
     @ui.button(label="Discard", style=discord.ButtonStyle.secondary, emoji="🗑️", custom_id="qa_btn_delete")
     async def delete_button(self, interaction: discord.Interaction, button: ui.Button):
+        if interaction.user.id not in EXPERT_IDS:
+            await interaction.response.send_message("🚫 **Access Denied:** Only designated Experts can discard tickets.", ephemeral=True)
+            return
+
         await interaction.message.delete()
         await interaction.response.send_message("🗑️ Ticket discarded.", ephemeral=True)
 
@@ -234,6 +280,10 @@ class ApprovalView(ui.View):
 
     @ui.button(label="Publish Publicly", style=discord.ButtonStyle.success, emoji="📢", custom_id="qa_btn_approve")
     async def approve(self, interaction: discord.Interaction, button: ui.Button):
+        if interaction.user.id not in EXPERT_IDS:
+            await interaction.response.send_message("🚫 **Access Denied:** Only designated Experts can publish answers.", ephemeral=True)
+            return
+
         embed = interaction.message.embeds[0]
         user_id = int(discord.utils.get(embed.fields, name="User ID").value)
         channel_id = int(discord.utils.get(embed.fields, name="Channel ID").value)
@@ -242,22 +292,33 @@ class ApprovalView(ui.View):
         await db_manager.add_qa(question_text, self.answer_text, user_id, interaction.user.id)
         await db_manager.update_karma(interaction.user.id, 15)
 
-        target_channel = interaction.guild.get_channel(channel_id)
+        target_channel = interaction.client.get_channel(channel_id)
+        
         if target_channel:
             success_embed = discord.Embed(
                 title="✨ Astra Home | New Knowledge Added",
                 description=f"**Q:** {question_text}\n\n**A:** {self.answer_text}",
                 color=SUCCESS_COLOR
             )
+            success_embed.set_footer(text=f"Answered by Expert: {interaction.user.display_name}")
             try:
                 await target_channel.send(f"📢 <@{user_id}>, your question has been answered!", embed=success_embed)
-            except: pass
+            except discord.Forbidden:
+                await interaction.followup.send("⚠️ Saved to DB, but failed to message user (Permissions).", ephemeral=True)
+            except Exception as e:
+                logger.error(f"Failed to send message to channel {channel_id}: {e}")
+        else:
+            await interaction.followup.send("⚠️ Saved to DB, but could not find the original channel.", ephemeral=True)
         
         await interaction.message.delete()
         await interaction.response.send_message(f"✅ Published! (+15 Karma for you)", ephemeral=True)
 
     @ui.button(label="Reject", style=discord.ButtonStyle.danger, emoji="❌", custom_id="qa_btn_reject")
     async def reject(self, interaction: discord.Interaction, button: ui.Button):
+        if interaction.user.id not in EXPERT_IDS:
+            await interaction.response.send_message("🚫 **Access Denied.**", ephemeral=True)
+            return
+            
         await interaction.message.delete()
         await interaction.response.send_message("↩️ Ticket rejected.", ephemeral=True)
 
@@ -273,12 +334,10 @@ class DisambiguationSelect(ui.Select):
         self.original_question = original_question
         
         options = []
-        # Add actual candidates
-        for i, c in enumerate(candidates[:24]): # Limit to 24 to leave room for the special option
+        for i, c in enumerate(candidates[:24]):
             label = c['q'][:90] + "..." if len(c['q']) > 90 else c['q']
             options.append(discord.SelectOption(label=label, value=str(i), emoji="🕉️"))
             
-        # Add the "Send to Experts" option
         options.append(discord.SelectOption(
             label="None of these / Send to Experts", 
             value="EXP_REQ", 
@@ -289,13 +348,11 @@ class DisambiguationSelect(ui.Select):
         super().__init__(placeholder="Select the correct question OR ask Experts:", options=options)
 
     async def callback(self, interaction: discord.Interaction):
-        # Security check
         if interaction.user.id != self.user.id:
             await interaction.response.send_message("This menu is not for you.", ephemeral=True)
             return
 
         if self.values[0] == "EXP_REQ":
-            # Handle "Send to Experts" selection
             review_channel = self.bot.get_channel(REVIEW_CHANNEL_ID)
             if not review_channel:
                 await interaction.response.send_message("⚠️ System Error: Review channel unavailable.", ephemeral=True)
@@ -321,7 +378,6 @@ class DisambiguationSelect(ui.Select):
             await interaction.response.edit_message(embed=confirm_embed, view=None)
 
         else:
-            # Handle standard selection
             selection = self.candidates[int(self.values[0])]
             embed = discord.Embed(title="🕉️ Knowledge Base", description=selection['a'], color=SUCCESS_COLOR)
             embed.add_field(name="Topic", value=selection['q'])
@@ -333,7 +389,6 @@ class DisambiguationView(ui.View):
         self.add_item(DisambiguationSelect(candidates, bot, user, original_question))
 
 class ConfirmSubmissionView(ui.View):
-    """View to ask user if they want to submit to experts when no match is found."""
     def __init__(self, bot, question, user):
         super().__init__(timeout=60)
         self.bot = bot
@@ -401,17 +456,30 @@ class AstraHomeBot(commands.Bot):
         await db_manager.initialize()
         await self.add_cog(QACog(self))
         await self.tree.sync()
+        self.rotate_status.start() # Start Status Loop
+
+    @tasks.loop(minutes=10)
+    async def rotate_status(self):
+        statuses = [
+            "/ask | Vedic Wisdom",
+            "Helping Seekers",
+            "Reading scriptures...",
+            "Meditating on Dharma",
+            "/quiz | Test Knowledge"
+        ]
+        await self.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name=random.choice(statuses)))
+
+    @rotate_status.before_loop
+    async def before_rotate(self):
+        await self.wait_until_ready()
 
 class QACog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
     def calculate_match_score(self, query: str, target: str) -> float:
-        # Stopwords to clean up matching (prevents "Who is X" matching "Who is Y" just because of "Who is")
         stopwords = {'who', 'what', 'where', 'when', 'why', 'how', 'is', 'are', 'the', 'a', 'an', 'in', 'of', 'for', 'to', 'do', 'does', 'did'}
-        
         def clean_text(text):
-            # Convert to lower, remove punctuation, remove stopwords
             words = ''.join(c for c in text.lower() if c.isalnum() or c.isspace()).split()
             cleaned = [w for w in words if w not in stopwords]
             return " ".join(cleaned)
@@ -419,16 +487,13 @@ class QACog(commands.Cog):
         query_clean = clean_text(query)
         target_clean = clean_text(target)
 
-        # If query is empty after cleaning (e.g. "Who is?"), fallback to raw
         if not query_clean:
             query_clean = query.lower()
             target_clean = target.lower()
 
-        # 1. Exact Substring Match on CLEANED TEXT
         if query_clean and query_clean in target_clean:
             return 0.95
         
-        # 2. Fuzzy Match on CLEANED TEXT
         return difflib.SequenceMatcher(None, query_clean, target_clean).ratio()
 
     @app_commands.command(name="ask", description="Ask a question. Fuzzy matching included.")
@@ -436,14 +501,11 @@ class QACog(commands.Cog):
         await interaction.response.defer(ephemeral=False)
         candidates = []
         
-        # Search Static
         for entry in STATIC_KNOWLEDGE_BASE:
             score = self.calculate_match_score(question, entry['q'])
-            # Increased threshold to 0.6 to prevent garbage matches
             if score > 0.6: 
                 candidates.append({'q': entry['q'], 'a': entry['a'], 'score': score, 'source': 'static'})
 
-        # Search DB
         db_rows = await db_manager.search_candidates(question)
         for row in db_rows:
             score = self.calculate_match_score(question, row['q'])
@@ -451,7 +513,6 @@ class QACog(commands.Cog):
                 candidates.append({'q': row['q'], 'a': row['a'], 'score': score, 'source': 'db'})
 
         candidates.sort(key=lambda x: x['score'], reverse=True)
-        # Dedupe
         unique = []
         seen = set()
         for c in candidates:
@@ -462,7 +523,6 @@ class QACog(commands.Cog):
         candidates = unique
 
         if not candidates:
-            # No match found -> Ask user if they want to forward to admin
             embed = discord.Embed(
                 title="🤔 No Answer Found",
                 description="I couldn't find a matching answer in the scriptures. Would you like to send this question to our **Experts**?",
@@ -472,19 +532,46 @@ class QACog(commands.Cog):
             await interaction.followup.send(embed=embed, view=view)
 
         elif len(candidates) == 1 and candidates[0]['score'] > 0.95:
-            # Only exact match auto-responds
             best = candidates[0]
             embed = discord.Embed(title="🕉️ Knowledge Base", description=best['a'], color=SUCCESS_COLOR)
             embed.add_field(name="Topic", value=best['q'])
             await interaction.followup.send(embed=embed)
         else:
-            # Multiple matches OR low-confidence match -> Show dropdown with Expert option
             await interaction.followup.send(
                 embed=discord.Embed(title="🔍 I found potential matches", description="Select the correct question, or send yours to the experts:", color=INFO_COLOR),
                 view=DisambiguationView(candidates, self.bot, interaction.user, question)
             )
 
-    # --- CRAZY NEW FEATURES ---
+    # --- ENHANCED FEATURES ---
+
+    @app_commands.command(name="daily", description="Claim your daily Karma reward (Every 24h).")
+    async def daily(self, interaction: discord.Interaction):
+        success, wait_time = await db_manager.claim_daily(interaction.user.id)
+        if not success:
+            hours = int(wait_time.total_seconds() // 3600)
+            mins = int((wait_time.total_seconds() % 3600) // 60)
+            await interaction.response.send_message(f"⏳ **Patience, seeker.** Come back in {hours}h {mins}m.", ephemeral=True)
+            return
+        
+        embed = discord.Embed(title="🌞 Daily Blessings", description="You have received **50 Karma** points today!", color=SUCCESS_COLOR)
+        embed.set_thumbnail(url="https://cdn-icons-png.flaticon.com/512/3233/3233497.png")
+        await interaction.response.send_message(embed=embed)
+
+    @app_commands.command(name="mantra", description="Receive a powerful Vedic Mantra for contemplation.")
+    async def mantra(self, interaction: discord.Interaction):
+        mantras = [
+            {"s": "Om Namah Shivaya", "m": "I bow to Shiva (The Self)", "b": "Peace, removal of fear, and spiritual awakening."},
+            {"s": "Om Gam Ganapataye Namaha", "m": "Salutations to Ganesha", "b": "Removal of obstacles and success in new ventures."},
+            {"s": "Gayatri Mantra", "m": "Om Bhur Bhuva Swaha...", "b": "Illumination of intellect and spiritual light."},
+            {"s": "Mahamrityunjaya Mantra", "m": "Om Tryambakam Yajamahe...", "b": "Healing, protection, and liberation from the fear of death."},
+            {"s": "Om Mani Padme Hum", "m": "The Jewel in the Lotus", "b": "Purification of the mind and cultivation of compassion."}
+        ]
+        choice = random.choice(mantras)
+        
+        embed = discord.Embed(title="📿 Sacred Mantra", description=f"# {choice['s']}", color=MYSTIC_COLOR)
+        embed.add_field(name="Meaning", value=choice['m'], inline=False)
+        embed.add_field(name="Benefit", value=choice['b'], inline=False)
+        await interaction.response.send_message(embed=embed)
 
     @app_commands.command(name="quiz", description="Test your Vedic knowledge and earn Karma!")
     async def quiz(self, interaction: discord.Interaction):
