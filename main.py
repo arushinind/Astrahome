@@ -6,7 +6,9 @@ import os
 import asyncio
 import aiosqlite
 import json
-from datetime import datetime
+import difflib
+import random
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 # ------------------------------------------------------------------
@@ -15,7 +17,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Advanced Logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(name)s | %(message)s',
@@ -23,49 +24,42 @@ logging.basicConfig(
 )
 logger = logging.getLogger('astra_home')
 
-# Branding & Colors
-BRAND_COLOR = 0x5865F2  # Blurple
-SUCCESS_COLOR = 0x57F287  # Green
-WARNING_COLOR = 0xFEE75C  # Gold
-ERROR_COLOR = 0xED4245    # Red
-INFO_COLOR = 0x3498db     # Blue
+BRAND_COLOR = 0x5865F2  
+SUCCESS_COLOR = 0x57F287  
+WARNING_COLOR = 0xFEE75C  
+ERROR_COLOR = 0xED4245    
+INFO_COLOR = 0x3498db     
+MYSTIC_COLOR = 0x9b59b6   # Purple for Magic/Oracle
 
 DB_NAME = os.getenv("DB_NAME", "astra_home.db")
 REVIEW_CHANNEL_ID = int(os.getenv("REVIEW_CHANNEL_ID", 0))
 
-# Global In-Memory Knowledge Base
 STATIC_KNOWLEDGE_BASE = []
 
 def load_knowledge_base():
-    """Loads the JSONL file into memory at startup."""
     global STATIC_KNOWLEDGE_BASE
     file_path = os.path.join("data", "hinduism.jsonl")
-    
     try:
-        # Check if file exists first
         if not os.path.exists(file_path):
             logger.warning(f"⚠️ Static Knowledge Base file not found at: {file_path}")
             return
-
         count = 0
         with open(file_path, "r", encoding="utf-8") as f:
             for line in f:
-                if line.strip():  # Skip empty lines
+                if line.strip():
                     try:
                         entry = json.loads(line)
                         if "q" in entry and "a" in entry:
                             STATIC_KNOWLEDGE_BASE.append(entry)
                             count += 1
                     except json.JSONDecodeError:
-                        logger.error(f"Skipping malformed JSON line in {file_path}")
-                        
-        logger.info(f"✅ Loaded {count} static entries from {file_path}")
-        
+                        continue
+        logger.info(f"✅ Loaded {count} static entries.")
     except Exception as e:
         logger.error(f"❌ Failed to load Knowledge Base: {e}")
 
 # ------------------------------------------------------------------
-# 2. DATABASE MANAGER (For Dynamic/User Data)
+# 2. DATABASE MANAGER
 # ------------------------------------------------------------------
 
 class DatabaseManager:
@@ -73,12 +67,12 @@ class DatabaseManager:
         self.db_name = db_name
 
     async def initialize(self):
-        """Creates tables for dynamic Q&A (User submitted)."""
         directory = os.path.dirname(self.db_name)
         if directory and not os.path.exists(directory):
             os.makedirs(directory)
 
         async with aiosqlite.connect(self.db_name) as db:
+            # FAQ Table
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS faq (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -90,11 +84,19 @@ class DatabaseManager:
                     use_count INTEGER DEFAULT 0
                 )
             """)
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_question ON faq(question_text)")
+            # Users/Karma Table
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    karma INTEGER DEFAULT 0,
+                    meditations INTEGER DEFAULT 0,
+                    last_meditation TIMESTAMP
+                )
+            """)
             await db.commit()
-            
         logger.info(f"Connected to Database: {self.db_name}")
 
+    # --- FAQ Logic ---
     async def add_qa(self, question: str, answer: str, author_id: int, approver_id: int):
         async with aiosqlite.connect(self.db_name) as db:
             await db.execute(
@@ -104,37 +106,24 @@ class DatabaseManager:
             )
             await db.commit()
 
-    async def find_answer(self, query: str):
-        """
-        Smart Search: Checks substrings and keywords in SQLite.
-        """
+    async def search_candidates(self, query: str):
         async with aiosqlite.connect(self.db_name) as db:
             cursor = await db.execute(
-                """
-                SELECT answer_text, id, use_count, question_text
+                """SELECT question_text, answer_text, id 
                 FROM faq 
                 WHERE question_text LIKE ? OR ? LIKE ('%' || question_text || '%')
-                ORDER BY length(question_text) DESC, use_count DESC LIMIT 1
-                """,
+                LIMIT 10""",
                 (f"%{query}%", query)
             )
-            row = await cursor.fetchone()
-            
-            if row:
-                answer, qa_id, count, matched_q = row
-                await db.execute("UPDATE faq SET use_count = ? WHERE id = ?", (count + 1, qa_id))
-                await db.commit()
-                return answer, matched_q
-            return None, None
+            rows = await cursor.fetchall()
+            return [{'q': r[0], 'a': r[1], 'source': 'db', 'id': r[2]} for r in rows]
 
     async def get_stats(self):
         async with aiosqlite.connect(self.db_name) as db:
             async with db.execute("SELECT COUNT(*) FROM faq") as cursor:
                 db_total = (await cursor.fetchone())[0]
-            
             async with db.execute("SELECT question_text, use_count FROM faq ORDER BY use_count DESC LIMIT 3") as cursor:
                 top_3 = await cursor.fetchall()
-                
             return db_total, top_3
 
     async def get_leaderboard(self):
@@ -148,10 +137,88 @@ class DatabaseManager:
             """) as cursor:
                 return await cursor.fetchall()
 
+    # --- Karma/User Logic ---
+    async def update_karma(self, user_id: int, points: int):
+        async with aiosqlite.connect(self.db_name) as db:
+            await db.execute("""
+                INSERT INTO users (user_id, karma) VALUES (?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET karma = karma + ?
+            """, (user_id, points, points))
+            await db.commit()
+
+    async def record_meditation(self, user_id: int):
+        now = datetime.now()
+        async with aiosqlite.connect(self.db_name) as db:
+            # Check cooldown (1 hour)
+            async with db.execute("SELECT last_meditation FROM users WHERE user_id = ?", (user_id,)) as cursor:
+                row = await cursor.fetchone()
+                if row and row[0]:
+                    last = datetime.fromisoformat(row[0])
+                    if now - last < timedelta(hours=1):
+                        return False, (timedelta(hours=1) - (now - last))
+
+            # Update stats
+            await db.execute("""
+                INSERT INTO users (user_id, karma, meditations, last_meditation) 
+                VALUES (?, 10, 1, ?)
+                ON CONFLICT(user_id) DO UPDATE SET 
+                    karma = karma + 10, 
+                    meditations = meditations + 1,
+                    last_meditation = ?
+            """, (user_id, now, now))
+            await db.commit()
+            return True, None
+
+    async def get_user_profile(self, user_id: int):
+        async with aiosqlite.connect(self.db_name) as db:
+            async with db.execute("SELECT karma, meditations FROM users WHERE user_id = ?", (user_id,)) as cursor:
+                return await cursor.fetchone()
+
 db_manager = DatabaseManager(DB_NAME)
 
 # ------------------------------------------------------------------
-# 3. UI COMPONENTS
+# 3. QUIZ & GAME COMPONENTS
+# ------------------------------------------------------------------
+
+class QuizButton(ui.Button):
+    def __init__(self, label, is_correct, quiz_view):
+        super().__init__(style=discord.ButtonStyle.secondary, label=label[:80]) # Limit length
+        self.is_correct = is_correct
+        self.quiz_view = quiz_view
+
+    async def callback(self, interaction: discord.Interaction):
+        # Disable all buttons
+        for child in self.view.children:
+            child.disabled = True
+            if isinstance(child, QuizButton):
+                if child.is_correct:
+                    child.style = discord.ButtonStyle.success
+                elif child == self:
+                    child.style = discord.ButtonStyle.danger
+
+        if self.is_correct:
+            await db_manager.update_karma(interaction.user.id, 5)
+            await interaction.response.edit_message(content="🎉 **Correct!** +5 Karma", view=self.view)
+        else:
+            await interaction.response.edit_message(content=f"❌ **Wrong!** The correct answer was highlighted.", view=self.view)
+        
+        self.view.stop()
+
+class QuizView(ui.View):
+    def __init__(self, correct_answer, wrong_answers):
+        super().__init__(timeout=30)
+        
+        # Combine and shuffle
+        options = [(correct_answer, True)]
+        for ans in wrong_answers:
+            options.append((ans, False))
+        random.shuffle(options)
+
+        for label, is_correct in options:
+            self.add_item(QuizButton(label, is_correct, self))
+
+# ------------------------------------------------------------------
+# 4. ADMIN & Q&A COMPONENTS
 # ------------------------------------------------------------------
 
 class AdminReviewView(ui.View):
@@ -170,16 +237,8 @@ class AdminReviewView(ui.View):
         await interaction.message.delete()
         await interaction.response.send_message("🗑️ Ticket discarded.", ephemeral=True)
 
-
 class AnswerModal(ui.Modal, title="Astra Home | Draft Response"):
-    answer_input = ui.TextInput(
-        label="Official Response",
-        style=discord.TextStyle.paragraph,
-        placeholder="Type the official answer here...",
-        min_length=10,
-        max_length=2000,
-        required=True
-    )
+    answer_input = ui.TextInput(label="Official Response", style=discord.TextStyle.paragraph, max_length=2000)
 
     def __init__(self, question_text):
         super().__init__()
@@ -195,10 +254,8 @@ class AnswerModal(ui.Modal, title="Astra Home | Draft Response"):
         for field in original_embed.fields:
             new_embed.add_field(name=field.name, value=field.value, inline=field.inline)
         new_embed.set_footer(text=f"Drafted by {interaction.user.display_name} • Approval Required")
-
         await interaction.message.edit(embed=new_embed, view=ApprovalView(self.answer_input.value))
-        await interaction.response.defer() 
-
+        await interaction.response.defer()
 
 class ApprovalView(ui.View):
     def __init__(self, answer_text):
@@ -208,59 +265,59 @@ class ApprovalView(ui.View):
     @ui.button(label="Publish Publicly", style=discord.ButtonStyle.success, emoji="📢", custom_id="qa_btn_approve")
     async def approve(self, interaction: discord.Interaction, button: ui.Button):
         embed = interaction.message.embeds[0]
-        user_id_field = discord.utils.get(embed.fields, name="User ID")
-        channel_id_field = discord.utils.get(embed.fields, name="Channel ID")
-        
-        if not user_id_field or not channel_id_field:
-            await interaction.response.send_message("❌ Error: Metadata corruption.", ephemeral=True)
-            return
-
-        user_id = int(user_id_field.value)
-        channel_id = int(channel_id_field.value)
-        desc_parts = embed.description.split("\n\n**Proposed Answer:**")
-        question_text = desc_parts[0].replace("**Inquiry:** ", "").strip()
+        user_id = int(discord.utils.get(embed.fields, name="User ID").value)
+        channel_id = int(discord.utils.get(embed.fields, name="Channel ID").value)
+        question_text = embed.description.split("\n\n**Proposed Answer:**")[0].replace("**Inquiry:** ", "").strip()
         
         await db_manager.add_qa(question_text, self.answer_text, user_id, interaction.user.id)
+        # Give admin karma
+        await db_manager.update_karma(interaction.user.id, 15)
 
         target_channel = interaction.guild.get_channel(channel_id)
         if target_channel:
             success_embed = discord.Embed(
                 title="✨ Astra Home | New Knowledge Added",
                 description=f"**Q:** {question_text}\n\n**A:** {self.answer_text}",
-                color=SUCCESS_COLOR,
-                timestamp=discord.utils.utcnow()
+                color=SUCCESS_COLOR
             )
-            success_embed.set_thumbnail(url="https://cdn-icons-png.flaticon.com/512/616/616490.png")
-            success_embed.set_footer(text=f"Approved by {interaction.user.display_name}")
-            
             try:
-                await target_channel.send(f"📢 <@{user_id}>, your question has been answered and added to the database!", embed=success_embed)
-            except discord.Forbidden:
-                await interaction.followup.send("⚠️ Saved to DB, but failed to message user.", ephemeral=True)
+                await target_channel.send(f"📢 <@{user_id}>, your question has been answered!", embed=success_embed)
+            except: pass
         
         await interaction.message.delete()
-        await interaction.response.send_message(f"✅ Response published.", ephemeral=True)
+        await interaction.response.send_message(f"✅ Published! (+15 Karma for you)", ephemeral=True)
 
     @ui.button(label="Reject", style=discord.ButtonStyle.danger, emoji="❌", custom_id="qa_btn_reject")
     async def reject(self, interaction: discord.Interaction, button: ui.Button):
-        embed = interaction.message.embeds[0]
-        desc_parts = embed.description.split("\n\n**Proposed Answer:**")
-        question_only = desc_parts[0].replace("**Inquiry:** ", "").strip()
-        
-        revert_embed = discord.Embed(
-            title="📨 Support Ticket (Returned)",
-            description=f"**Inquiry:**\n{question_only}",
-            color=BRAND_COLOR
-        )
-        for field in embed.fields:
-            revert_embed.add_field(name=field.name, value=field.value, inline=field.inline)
-        revert_embed.set_footer(text="Astra Home Admin Panel • Returned for Edit")
-            
-        await interaction.message.edit(embed=revert_embed, view=AdminReviewView())
-        await interaction.response.send_message("↩️ Ticket returned to queue.", ephemeral=True)
+        await interaction.message.delete()
+        await interaction.response.send_message("↩️ Ticket rejected.", ephemeral=True)
 
 # ------------------------------------------------------------------
-# 4. BOT COMMANDS
+# 5. DISAMBIGUATION
+# ------------------------------------------------------------------
+
+class DisambiguationSelect(ui.Select):
+    def __init__(self, candidates):
+        self.candidates = candidates
+        options = []
+        for i, c in enumerate(candidates[:25]):
+            label = c['q'][:95] + "..." if len(c['q']) > 95 else c['q']
+            options.append(discord.SelectOption(label=label, value=str(i), emoji="🕉️"))
+        super().__init__(placeholder="Select the correct question:", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        selection = self.candidates[int(self.values[0])]
+        embed = discord.Embed(title="🕉️ Knowledge Base", description=selection['a'], color=SUCCESS_COLOR)
+        embed.add_field(name="Topic", value=selection['q'])
+        await interaction.response.edit_message(embed=embed, view=None)
+
+class DisambiguationView(ui.View):
+    def __init__(self, candidates):
+        super().__init__(timeout=60)
+        self.add_item(DisambiguationSelect(candidates))
+
+# ------------------------------------------------------------------
+# 6. BOT COMMANDS
 # ------------------------------------------------------------------
 
 class AstraHomeBot(commands.Bot):
@@ -275,150 +332,181 @@ class AstraHomeBot(commands.Bot):
         )
 
     async def setup_hook(self):
-        load_knowledge_base() # 1. Load File Data
-        await db_manager.initialize() # 2. Connect DB
+        load_knowledge_base()
+        await db_manager.initialize()
         await self.add_cog(QACog(self))
-        logger.info("🔄 Syncing commands...")
         await self.tree.sync()
-        logger.info("✅ Commands synced.")
-
-    async def on_ready(self):
-        logger.info(f'🚀 Astra Home Bot logged in as {self.user}')
 
 class QACog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    # --- USER COMMANDS ---
+    def calculate_match_score(self, query: str, target: str) -> float:
+        query_l, target_l = query.lower(), target.lower()
+        if query_l in target_l: return 1.0
+        return difflib.SequenceMatcher(None, query_l, target_l).ratio()
 
-    @app_commands.command(name="ask", description="Ask a question (Public). Answers instantly if known.")
-    @app_commands.describe(question="What would you like to know?")
+    @app_commands.command(name="ask", description="Ask a question. Fuzzy matching included.")
     async def ask(self, interaction: discord.Interaction, question: str):
         await interaction.response.defer(ephemeral=False)
-
-        # 1. SEARCH IN-MEMORY STATIC DATA (File Based)
-        # ----------------------------------------------------
-        q_lower = question.lower()
-        static_answer = None
-        static_topic = None
-
-        for entry in STATIC_KNOWLEDGE_BASE:
-            # Check if user query is in stored question OR stored question is in user query
-            kb_q = entry.get("q", "").lower()
-            if kb_q and (kb_q in q_lower or q_lower in kb_q):
-                static_answer = entry.get("a")
-                static_topic = entry.get("q")
-                break
+        candidates = []
         
-        if static_answer:
-            embed = discord.Embed(
-                title="🕉️ Astra Home Knowledge Base",
-                description=static_answer,
-                color=SUCCESS_COLOR
-            )
-            embed.add_field(name="Topic", value=static_topic, inline=False)
-            embed.set_footer(text=f"Asked by {interaction.user.display_name} • Knowledge File")
-            await interaction.followup.send(embed=embed)
-            return
+        # Search Static
+        for entry in STATIC_KNOWLEDGE_BASE:
+            score = self.calculate_match_score(question, entry['q'])
+            if score > 0.4:
+                candidates.append({'q': entry['q'], 'a': entry['a'], 'score': score, 'source': 'static'})
 
-        # 2. SEARCH DATABASE (Dynamic Data)
-        # ----------------------------------------------------
-        answer, matched_q = await db_manager.find_answer(question)
+        # Search DB
+        db_rows = await db_manager.search_candidates(question)
+        for row in db_rows:
+            score = self.calculate_match_score(question, row['q'])
+            candidates.append({'q': row['q'], 'a': row['a'], 'score': score, 'source': 'db'})
 
-        if answer:
-            embed = discord.Embed(
-                title="🕉️ Astra Home Knowledge Base",
-                description=answer,
-                color=SUCCESS_COLOR
-            )
-            embed.add_field(name="Topic", value=matched_q, inline=False)
-            embed.set_footer(text=f"Asked by {interaction.user.display_name} • Community Verified")
-            await interaction.followup.send(embed=embed)
-        else:
-            # 3. FALLBACK: ADMIN REVIEW
-            # ----------------------------------------------------
+        candidates.sort(key=lambda x: x['score'], reverse=True)
+        # Dedupe
+        unique = []
+        seen = set()
+        for c in candidates:
+            if c['q'] not in seen:
+                unique.append(c)
+                seen.add(c['q'])
+        
+        candidates = unique
+
+        if not candidates:
+            # Fallback to Admin
             review_channel = self.bot.get_channel(REVIEW_CHANNEL_ID)
             if not review_channel:
-                await interaction.followup.send("⚠️ System Error: Review channel unavailable.", ephemeral=True)
+                await interaction.followup.send("⚠️ No match found & Review channel missing.", ephemeral=True)
                 return
 
-            embed = discord.Embed(
-                title="📨 New Question Received",
-                description=f"**Inquiry:**\n{question}",
-                color=BRAND_COLOR,
-                timestamp=discord.utils.utcnow()
-            )
-            embed.set_author(name=f"{interaction.user.display_name}", icon_url=interaction.user.display_avatar.url)
-            embed.add_field(name="User ID", value=str(interaction.user.id), inline=True)
-            embed.add_field(name="Channel ID", value=str(interaction.channel_id), inline=True)
-            embed.add_field(name="Source", value=interaction.channel.mention if interaction.channel else "Unknown", inline=True)
-            embed.set_footer(text="Awaiting Expert Answer")
-
+            embed = discord.Embed(title="📨 New Question", description=f"**Inquiry:**\n{question}", color=BRAND_COLOR)
+            embed.add_field(name="User ID", value=str(interaction.user.id))
+            embed.add_field(name="Channel ID", value=str(interaction.channel_id))
             await review_channel.send(embed=embed, view=AdminReviewView())
-            
-            confirm_embed = discord.Embed(
-                description=f"✅ **Good Question!** I don't have the answer yet, so I've forwarded it to the **Astra Home Experts**. You will be notified here when they answer.",
-                color=BRAND_COLOR
+            await interaction.followup.send("✅ Sent to experts for review.")
+
+        elif len(candidates) == 1 or (candidates[0]['score'] > 0.95):
+            best = candidates[0]
+            embed = discord.Embed(title="🕉️ Knowledge Base", description=best['a'], color=SUCCESS_COLOR)
+            embed.add_field(name="Topic", value=best['q'])
+            await interaction.followup.send(embed=embed)
+        else:
+            await interaction.followup.send(
+                embed=discord.Embed(title="🔍 Multiple Matches", description="Select the best fit:", color=INFO_COLOR),
+                view=DisambiguationView(candidates)
             )
-            await interaction.followup.send(embed=confirm_embed)
 
-    @app_commands.command(name="ping", description="Check bot latency.")
-    async def ping(self, interaction: discord.Interaction):
-        latency = round(self.bot.latency * 1000)
-        await interaction.response.send_message(f"🏓 Pong! Latency: **{latency}ms**", ephemeral=True)
+    # --- CRAZY NEW FEATURES (STRICTLY THEMED) ---
 
-    @app_commands.command(name="stats", description="View Knowledge Base Statistics.")
-    async def stats(self, interaction: discord.Interaction):
-        # Stats now combine Static File count + DB count
-        db_total, top_3 = await db_manager.get_stats()
-        static_total = len(STATIC_KNOWLEDGE_BASE)
-        total_combined = db_total + static_total
-        
-        embed = discord.Embed(title="📊 Astra Home Stats", color=INFO_COLOR)
-        embed.add_field(name="Total Knowledge", value=f"{total_combined} ({static_total} Static / {db_total} Community)", inline=False)
-        
-        top_text = ""
-        for i, (q, count) in enumerate(top_3, 1):
-            top_text += f"**{i}.** {q} ({count} views)\n"
-        
-        if top_text:
-            embed.add_field(name="🔥 Trending Community Topics", value=top_text, inline=False)
-            
-        await interaction.response.send_message(embed=embed)
-
-    # --- ADMIN COMMANDS ---
-
-    @app_commands.command(name="leaderboard", description="[Admin] Top Contributors.")
-    @app_commands.default_permissions(administrator=True)
-    async def leaderboard(self, interaction: discord.Interaction):
-        rows = await db_manager.get_leaderboard()
-        if not rows:
-            await interaction.response.send_message("No contributions yet!", ephemeral=True)
+    @app_commands.command(name="quiz", description="Test your Vedic knowledge and earn Karma!")
+    async def quiz(self, interaction: discord.Interaction):
+        if len(STATIC_KNOWLEDGE_BASE) < 4:
+            await interaction.response.send_message("Not enough data for a quiz yet!", ephemeral=True)
             return
 
-        embed = discord.Embed(title="🏆 Admin Leaderboard", color=WARNING_COLOR)
-        desc = ""
-        for i, (uid, score) in enumerate(rows, 1):
-            desc += f"**{i}.** <@{uid}> - **{score}** answers\n"
+        question_data = random.choice(STATIC_KNOWLEDGE_BASE)
+        correct_answer = question_data['a']
         
-        embed.description = desc
+        # Get 3 random wrong answers
+        distractors = random.sample([x['a'] for x in STATIC_KNOWLEDGE_BASE if x['q'] != question_data['q']], 3)
+        
+        embed = discord.Embed(
+            title="🧠 Astra Wisdom Quiz",
+            description=f"**Question:** {question_data['q']}",
+            color=MYSTIC_COLOR
+        )
+        embed.set_footer(text="Select the correct answer below. (+5 Karma)")
+        
+        await interaction.response.send_message(embed=embed, view=QuizView(correct_answer, distractors))
+
+    @app_commands.command(name="meditate", description="Perform a Dhyana (Meditation) session.")
+    async def meditate(self, interaction: discord.Interaction):
+        success, wait_time = await db_manager.record_meditation(interaction.user.id)
+        
+        if not success:
+            mins = int(wait_time.total_seconds() // 60)
+            await interaction.response.send_message(f"🧘 You must rest. You can meditate again in {mins} minutes.", ephemeral=True)
+            return
+
+        msg = await interaction.response.send_message("🧘 **Entering Asana...** (Posture)", ephemeral=False)
+        msg = await interaction.original_response()
+        
+        # Sanskrit/Vedic Stages
+        stages = [
+            "🌬️ **Pranayama...** (Controlling breath) [==........]",
+            "👁️ **Pratyahara...** (Withdrawing senses) [====......]",
+            "🧠 **Dharana...** (Concentration) [======....]",
+            "🕉️ **Dhyana...** (Deep Meditation) [========..]",
+            "✨ **Samadhi...** (Oneness) [==========]"
+        ]
+        
+        for stage in stages:
+            await asyncio.sleep(1.5)
+            await msg.edit(content=stage)
+        
+        # Strictly Scriptural Quotes
+        quotes = [
+            "“You have a right to perform your prescribed duties, but you are not entitled to the fruits of your actions.” – *Bhagavad Gita 2.47*",
+            "“Yoga is the journey of the self, through the self, to the self.” – *Bhagavad Gita 6.20*",
+            "“As a lamp in a windless place does not flicker, so is the disciplined mind of a yogi practicing meditation.” – *Bhagavad Gita 6.19*",
+            "“Lead me from the unreal to the real, lead me from darkness to light, lead me from death to immortality.” – *Brihadaranyaka Upanishad*",
+            "“The little space within the heart is as great as the vast universe.” – *Chandogya Upanishad*"
+        ]
+        
+        final_embed = discord.Embed(title="🙏 Shanti (Peace)", description=random.choice(quotes), color=SUCCESS_COLOR)
+        final_embed.set_footer(text="+10 Karma gained")
+        await msg.edit(content="", embed=final_embed)
+
+    @app_commands.command(name="profile", description="Check your spiritual standing.")
+    async def profile(self, interaction: discord.Interaction):
+        row = await db_manager.get_user_profile(interaction.user.id)
+        if not row:
+            karma, meditations = 0, 0
+        else:
+            karma, meditations = row
+
+        # Thematic Ranks
+        if karma < 50: rank = "Sadhaka (Aspirant)"
+        elif karma < 150: rank = "Brahmachari (Student)"
+        elif karma < 300: rank = "Yogi (Practitioner)"
+        elif karma < 500: rank = "Rishi (Sage)"
+        else: rank = "Maharishi (Great Sage)"
+
+        embed = discord.Embed(title=f"📜 {interaction.user.display_name}'s Profile", color=INFO_COLOR)
+        embed.set_thumbnail(url=interaction.user.display_avatar.url)
+        embed.add_field(name="Dharma Rank", value=f"**{rank}**", inline=False)
+        embed.add_field(name="🌀 Karma", value=str(karma), inline=True)
+        embed.add_field(name="🧘 Dhyana Sessions", value=str(meditations), inline=True)
+        
         await interaction.response.send_message(embed=embed)
 
-# ------------------------------------------------------------------
-# 5. ENTRY POINT
-# ------------------------------------------------------------------
+    @app_commands.command(name="oracle", description="Seek guidance from the Shastras.")
+    async def oracle(self, interaction: discord.Interaction, query: str):
+        # Strictly Dharmic responses
+        responses = [
+            "This path aligns with your Dharma.",
+            "Obstacles (Vighna) are present; perform selfless service (Seva) first.",
+            "The outcome depends on your past Karma.",
+            "Meditate on this; the answer lies within the Atman.",
+            "Detach from the result, focus only on the action (Karma Yoga).",
+            "Time (Kala) is the ultimate decider.",
+            "Sattva Guna (purity) is required for success here."
+        ]
+        
+        embed = discord.Embed(title="📜 Vedic Guidance", color=MYSTIC_COLOR)
+        embed.add_field(name="Inquiry", value=query, inline=False)
+        embed.add_field(name="Insight", value=f"||{random.choice(responses)}||", inline=False)
+        
+        await interaction.response.send_message(embed=embed)
 
 async def main():
     token = os.getenv("DISCORD_TOKEN")
-    if not token:
-        logger.critical("⛔ DISCORD_TOKEN not found.")
-        return
+    if not token: return
     bot = AstraHomeBot()
-    async with bot:
-        await bot.start(token)
+    async with bot: await bot.start(token)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    try: asyncio.run(main())
+    except KeyboardInterrupt: pass
