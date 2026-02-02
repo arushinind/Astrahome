@@ -5,6 +5,7 @@ import logging
 import os
 import asyncio
 import aiosqlite
+import json
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -32,65 +33,39 @@ INFO_COLOR = 0x3498db     # Blue
 DB_NAME = os.getenv("DB_NAME", "astra_home.db")
 REVIEW_CHANNEL_ID = int(os.getenv("REVIEW_CHANNEL_ID", 0))
 
-# ------------------------------------------------------------------
-# 2. HINDUISM KNOWLEDGE BASE (EXPANDED)
-# ------------------------------------------------------------------
+# Global In-Memory Knowledge Base
+STATIC_KNOWLEDGE_BASE = []
 
-HINDUISM_DATA = [
-    ("What is Hinduism?", "Hinduism, or Sanatana Dharma, is the world's oldest living religion. It is a synthesis of various Indian cultures and traditions, with diverse beliefs including Dharma, Karma, Samsara (cycle of rebirth), and Moksha (liberation)."),
-    ("Who are the Trimurti?", "The Trimurti represents the three cosmic functions: Brahma (The Creator), Vishnu (The Preserver), and Shiva (The Destroyer/Transformer)."),
-    ("What is Karma?", "Karma is the universal law of cause and effect. Every thought, word, and action creates energy that influences a person's future and next life."),
-    ("What is Dharma?", "Dharma is the moral order of the universe and a code of living. It signifies duty, righteousness, and the path one must follow in life."),
-    ("Who is Lord Ganesha?", "Ganesha is the elephant-headed deity, revered as the remover of obstacles (Vighnaharta), the patron of arts and sciences, and the god of intellect and wisdom."),
-    ("Who is Lord Shiva?", "Shiva is the Supreme Being in Shaivism. He is the destroyer of evil and the transformer, often depicted as a yogi in deep meditation on Mount Kailash."),
-    ("Who is Lord Vishnu?", "Vishnu is the preserver of the universe in Vaishnavism. He incarnates (Avatars) on Earth to restore balance when evil threatens Dharma. Famous avatars include Rama and Krishna."),
-    ("What is the Bhagavad Gita?", "The Bhagavad Gita is a 700-verse scripture that is part of the Mahabharata. It is a conversation between Prince Arjuna and Lord Krishna concerning duty (Dharma) and spiritual liberation."),
-    ("What are the Vedas?", "The Vedas are the oldest scriptures of Hinduism, considered 'shruti' (that which is heard). The four Vedas are: Rigveda, Samaveda, Yajurveda, and Atharvaveda."),
-    ("What is Moksha?", "Moksha is the liberation from Samsara, the cycle of birth, death, and rebirth. It is the ultimate goal of human life in Hindu philosophy."),
-    ("What is Yoga?", "Yoga is a group of physical, mental, and spiritual practices originating in ancient India, aimed at controlling the mind and recognizing the detached 'witness-consciousness'."),
-    ("What is Atman?", "Atman refers to the self, soul, or spirit. In Hindu philosophy, realizing that the Atman is distinct from the body and mind is a key step towards Moksha."),
-    ("What is Brahman?", "Brahman is the ultimate reality, the formless, infinite, and eternal source of all existence in Hindu philosophy."),
-    ("Who is Hanuman?", "Hanuman is a divine vanara (monkey) companion of the god Rama. He is a symbol of strength, energy, and selfless devotion (Bhakti)."),
-    ("What is Diwali?", "Diwali is the festival of lights, symbolizing the spiritual victory of light over darkness, good over evil, and knowledge over ignorance."),
-    ("What is Holi?", "Holi is the festival of colors, celebrating the arrival of spring and the victory of good over evil (Holika Dahan)."),
-    ("What is a Mantra?", "A mantra is a sacred utterance, a numinous sound, a syllable, word or phonemes, or group of words in Sanskrit believed to have psychological and/or spiritual powers."),
-    ("What is Om?", "Om (Aum) is the sacred sound and spiritual symbol in Hinduism. It signifies the essence of the ultimate reality, consciousness, or Atman."),
-    ("What is Reincarnation?", "Reincarnation is the philosophical concept that the non-physical essence of a living being starts a new life in a different physical form or body after biological death."),
-    ("Who is Goddess Durga?", "Durga is a major deity in Hinduism, worshipped as a principal aspect of the mother goddess Devi. She is associated with protection, strength, motherhood, and destruction of wars."),
-    ("Who is Goddess Lakshmi?", "Lakshmi is the goddess of wealth, fortune, power, beauty, and prosperity. She is the wife and active energy (Shakti) of Vishnu."),
-    ("Who is Goddess Saraswati?", "Saraswati is the goddess of knowledge, music, art, speech, wisdom, and learning."),
-    ("What is the Ramayana?", "The Ramayana is an ancient Indian epic which narrates the struggle of the divine prince Rama to rescue his wife Sita from the demon king Ravana."),
-    ("What is the Mahabharata?", "The Mahabharata is one of the two major Sanskrit epics of ancient India. It narrates the struggle between two groups of cousins in the Kurukshetra War and the fates of the Kaurava and the Pandava princes."),
-    ("What is Puja?", "Puja is a prayer ritual performed by Hindus of devotional worship to one or more deities, or to host and honor a guest, or one to spiritually celebrate an event."),
-    ("What is a Guru?", "A Guru is a spiritual teacher or guide who helps the disciple on the path to self-realization."),
-    ("What is Ahimsa?", "Ahimsa is the principle of non-violence toward all living beings. It is a key virtue in Hinduism, Jainism, and Buddhism."),
-    ("What are the 4 aims of life?", "The Purusharthas are the four proper goals of a human life: Dharma (righteousness), Artha (prosperity), Kama (pleasure), and Moksha (liberation)."),
-    ("What is a Temple (Mandir)?", "A Mandir is a Hindu temple, a symbolic house, seat and body of god. It is a structure designed to bring human beings and gods together."),
-    ("What is Tilak?", "A Tilak is a mark worn usually on the forehead, sometimes other parts of the body such as neck, hand or chest. It may be worn daily or for rites of passage or special religious occasions."),
-    ("What is Prasad?", "Prasad is a material substance of food that is a religious offering in both Hinduism and Sikhism. It is normally consumed by worshippers after worship."),
-    ("Who is Krishna?", "Krishna is a major deity in Hinduism. He is worshipped as the eighth avatar of Vishnu and also as the supreme God in his own right."),
-    ("What is Navaratri?", "Navaratri is a Hindu festival that spans nine nights (and ten days) and is celebrated every year in the autumn. It is observed for different reasons and celebrated differently in various parts of the Indian cultural sphere."),
-    ("What is Karma Yoga?", "Karma Yoga is the spiritual discipline of selfless action as a way to perfection."),
-    ("What is Bhakti Yoga?", "Bhakti Yoga is a spiritual path or spiritual practice within Hinduism focused on loving devotion towards any personal deity."),
-    ("What is Jnana Yoga?", "Jnana Yoga is the spiritual discipline of knowledge and insight."),
-    ("What is Raja Yoga?", "Raja Yoga is the path of meditation and self-discipline."),
-    ("What is Advaita Vedanta?", "Advaita Vedanta is a school of Hindu philosophy that emphasizes the oneness of the individual soul (Atman) and the ultimate reality (Brahman)."),
-    ("Who is Adi Shankaracharya?", "Adi Shankaracharya was an early 8th-century Indian philosopher and theologian who consolidated the doctrine of Advaita Vedanta."),
-    ("What is Ayurveda?", "Ayurveda is a traditional system of medicine with historical roots in the Indian subcontinent."),
-    ("What is the Caste System (Varna)?", "The Varna system classifies society into four classes: Brahmins (priests), Kshatriyas (warriors), Vaishyas (merchants), and Shudras (laborers). It was originally based on qualities and duties, not birth, though it rigidified over time."),
-    ("What is a Sannyasin?", "A Sannyasin is one who has renounced the world in order to attain Moksha."),
-    ("What is Maya?", "Maya is the illusion or magic power with which a god can make human beings believe in what turns out to be an illusion."),
-    ("What is Samsara?", "Samsara is the beginningless cycle of repeated birth, mundane existence and dying again."),
-    ("What is Sanatana Dharma?", "Sanatana Dharma is the eternal order or eternal duty, the indigenous name for Hinduism."),
-    ("Who is Kartikeya?", "Kartikeya (also Murugan or Skanda) is the Hindu god of war and the son of Shiva and Parvati."),
-    ("What is a Yajna?", "Yajna refers to any ritual done in front of a sacred fire, often with mantras."),
-    ("What is Raksha Bandhan?", "Raksha Bandhan is a popular, traditionally Hindu, annual rite, or ceremony, which is central to a festival of the same name, celebrating the love and duty between brothers and sisters."),
-    ("Who is Yamraj?", "Yama is the Hindu god of death and justice, responsible for dispensing the law and punishing sinners in their afterlives."),
-    ("What is Swastika?", "The Swastika is a geometrical figure and an ancient religious icon in the cultures of Eurasia. In Hinduism, it is a symbol of divinity and spirituality.")
-]
+def load_knowledge_base():
+    """Loads the JSONL file into memory at startup."""
+    global STATIC_KNOWLEDGE_BASE
+    file_path = os.path.join("data", "hinduism.jsonl")
+    
+    try:
+        # Check if file exists first
+        if not os.path.exists(file_path):
+            logger.warning(f"⚠️ Static Knowledge Base file not found at: {file_path}")
+            return
+
+        count = 0
+        with open(file_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():  # Skip empty lines
+                    try:
+                        entry = json.loads(line)
+                        if "q" in entry and "a" in entry:
+                            STATIC_KNOWLEDGE_BASE.append(entry)
+                            count += 1
+                    except json.JSONDecodeError:
+                        logger.error(f"Skipping malformed JSON line in {file_path}")
+                        
+        logger.info(f"✅ Loaded {count} static entries from {file_path}")
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to load Knowledge Base: {e}")
 
 # ------------------------------------------------------------------
-# 3. DATABASE MANAGER
+# 2. DATABASE MANAGER (For Dynamic/User Data)
 # ------------------------------------------------------------------
 
 class DatabaseManager:
@@ -98,7 +73,7 @@ class DatabaseManager:
         self.db_name = db_name
 
     async def initialize(self):
-        """Creates tables and automatically seeds data."""
+        """Creates tables for dynamic Q&A (User submitted)."""
         directory = os.path.dirname(self.db_name)
         if directory and not os.path.exists(directory):
             os.makedirs(directory)
@@ -118,38 +93,7 @@ class DatabaseManager:
             await db.execute("CREATE INDEX IF NOT EXISTS idx_question ON faq(question_text)")
             await db.commit()
             
-            # Auto-Seed Check
-            async with db.execute("SELECT COUNT(*) FROM faq") as cursor:
-                row = await cursor.fetchone()
-                count = row[0]
-                logger.info(f"Database currently holds {count} entries.")
-                if count < 5: # If DB is nearly empty, force seed
-                    await self.seed_data(db)
-
-    async def seed_data(self, db_conn=None):
-        """Injects the Hinduism dataset."""
-        logger.info("⚡ Seeding Knowledge Base with Hinduism Data...")
-        
-        # Helper to execute insert
-        async def insert_many(conn):
-            for q, a in HINDUISM_DATA:
-                # Check if exists first to prevent dupes during manual seed
-                cursor = await conn.execute("SELECT id FROM faq WHERE question_text = ?", (q,))
-                if not await cursor.fetchone():
-                    await conn.execute(
-                        """INSERT INTO faq (question_text, answer_text, author_id, approver_id, created_at)
-                        VALUES (?, ?, 0, 0, ?)""",
-                        (q, a, datetime.now())
-                    )
-            await conn.commit()
-
-        if db_conn:
-            await insert_many(db_conn)
-        else:
-            async with aiosqlite.connect(self.db_name) as db:
-                await insert_many(db)
-        
-        logger.info(f"✅ Seeding Complete. Added {len(HINDUISM_DATA)} entries.")
+        logger.info(f"Connected to Database: {self.db_name}")
 
     async def add_qa(self, question: str, answer: str, author_id: int, approver_id: int):
         async with aiosqlite.connect(self.db_name) as db:
@@ -162,12 +106,9 @@ class DatabaseManager:
 
     async def find_answer(self, query: str):
         """
-        Smart Search: Checks substrings and keywords.
+        Smart Search: Checks substrings and keywords in SQLite.
         """
         async with aiosqlite.connect(self.db_name) as db:
-            # Logic:
-            # 1. Check if stored question is inside user query ("What is Karma please" contains "What is Karma")
-            # 2. Check if user query is inside stored question (User types "Karma", matches "What is Karma?")
             cursor = await db.execute(
                 """
                 SELECT answer_text, id, use_count, question_text
@@ -189,12 +130,12 @@ class DatabaseManager:
     async def get_stats(self):
         async with aiosqlite.connect(self.db_name) as db:
             async with db.execute("SELECT COUNT(*) FROM faq") as cursor:
-                total = (await cursor.fetchone())[0]
+                db_total = (await cursor.fetchone())[0]
             
             async with db.execute("SELECT question_text, use_count FROM faq ORDER BY use_count DESC LIMIT 3") as cursor:
                 top_3 = await cursor.fetchall()
                 
-            return total, top_3
+            return db_total, top_3
 
     async def get_leaderboard(self):
         async with aiosqlite.connect(self.db_name) as db:
@@ -210,7 +151,7 @@ class DatabaseManager:
 db_manager = DatabaseManager(DB_NAME)
 
 # ------------------------------------------------------------------
-# 4. UI COMPONENTS
+# 3. UI COMPONENTS
 # ------------------------------------------------------------------
 
 class AdminReviewView(ui.View):
@@ -289,11 +230,10 @@ class ApprovalView(ui.View):
                 color=SUCCESS_COLOR,
                 timestamp=discord.utils.utcnow()
             )
-            success_embed.set_thumbnail(url="https://cdn-icons-png.flaticon.com/512/616/616490.png") # Generic Om symbol or star
+            success_embed.set_thumbnail(url="https://cdn-icons-png.flaticon.com/512/616/616490.png")
             success_embed.set_footer(text=f"Approved by {interaction.user.display_name}")
             
             try:
-                # Ping the user but send embed publicly
                 await target_channel.send(f"📢 <@{user_id}>, your question has been answered and added to the database!", embed=success_embed)
             except discord.Forbidden:
                 await interaction.followup.send("⚠️ Saved to DB, but failed to message user.", ephemeral=True)
@@ -320,7 +260,7 @@ class ApprovalView(ui.View):
         await interaction.response.send_message("↩️ Ticket returned to queue.", ephemeral=True)
 
 # ------------------------------------------------------------------
-# 5. BOT COMMANDS
+# 4. BOT COMMANDS
 # ------------------------------------------------------------------
 
 class AstraHomeBot(commands.Bot):
@@ -335,7 +275,8 @@ class AstraHomeBot(commands.Bot):
         )
 
     async def setup_hook(self):
-        await db_manager.initialize()
+        load_knowledge_base() # 1. Load File Data
+        await db_manager.initialize() # 2. Connect DB
         await self.add_cog(QACog(self))
         logger.info("🔄 Syncing commands...")
         await self.tree.sync()
@@ -353,26 +294,49 @@ class QACog(commands.Cog):
     @app_commands.command(name="ask", description="Ask a question (Public). Answers instantly if known.")
     @app_commands.describe(question="What would you like to know?")
     async def ask(self, interaction: discord.Interaction, question: str):
-        # CHANGED: ephemeral=False ensures everyone sees the response
         await interaction.response.defer(ephemeral=False)
 
-        # 1. Search DB
+        # 1. SEARCH IN-MEMORY STATIC DATA (File Based)
+        # ----------------------------------------------------
+        q_lower = question.lower()
+        static_answer = None
+        static_topic = None
+
+        for entry in STATIC_KNOWLEDGE_BASE:
+            # Check if user query is in stored question OR stored question is in user query
+            kb_q = entry.get("q", "").lower()
+            if kb_q and (kb_q in q_lower or q_lower in kb_q):
+                static_answer = entry.get("a")
+                static_topic = entry.get("q")
+                break
+        
+        if static_answer:
+            embed = discord.Embed(
+                title="🕉️ Astra Home Knowledge Base",
+                description=static_answer,
+                color=SUCCESS_COLOR
+            )
+            embed.add_field(name="Topic", value=static_topic, inline=False)
+            embed.set_footer(text=f"Asked by {interaction.user.display_name} • Knowledge File")
+            await interaction.followup.send(embed=embed)
+            return
+
+        # 2. SEARCH DATABASE (Dynamic Data)
+        # ----------------------------------------------------
         answer, matched_q = await db_manager.find_answer(question)
 
         if answer:
-            # Answer Found
             embed = discord.Embed(
                 title="🕉️ Astra Home Knowledge Base",
                 description=answer,
                 color=SUCCESS_COLOR
             )
             embed.add_field(name="Topic", value=matched_q, inline=False)
-            embed.set_footer(text=f"Asked by {interaction.user.display_name} • Instant Answer")
-            
-            # Send public response
+            embed.set_footer(text=f"Asked by {interaction.user.display_name} • Community Verified")
             await interaction.followup.send(embed=embed)
         else:
-            # Send to Admin Review
+            # 3. FALLBACK: ADMIN REVIEW
+            # ----------------------------------------------------
             review_channel = self.bot.get_channel(REVIEW_CHANNEL_ID)
             if not review_channel:
                 await interaction.followup.send("⚠️ System Error: Review channel unavailable.", ephemeral=True)
@@ -405,17 +369,20 @@ class QACog(commands.Cog):
 
     @app_commands.command(name="stats", description="View Knowledge Base Statistics.")
     async def stats(self, interaction: discord.Interaction):
-        total, top_3 = await db_manager.get_stats()
+        # Stats now combine Static File count + DB count
+        db_total, top_3 = await db_manager.get_stats()
+        static_total = len(STATIC_KNOWLEDGE_BASE)
+        total_combined = db_total + static_total
         
         embed = discord.Embed(title="📊 Astra Home Stats", color=INFO_COLOR)
-        embed.add_field(name="Total Questions", value=str(total), inline=False)
+        embed.add_field(name="Total Knowledge", value=f"{total_combined} ({static_total} Static / {db_total} Community)", inline=False)
         
         top_text = ""
         for i, (q, count) in enumerate(top_3, 1):
             top_text += f"**{i}.** {q} ({count} views)\n"
         
         if top_text:
-            embed.add_field(name="🔥 Trending Topics", value=top_text, inline=False)
+            embed.add_field(name="🔥 Trending Community Topics", value=top_text, inline=False)
             
         await interaction.response.send_message(embed=embed)
 
@@ -437,15 +404,8 @@ class QACog(commands.Cog):
         embed.description = desc
         await interaction.response.send_message(embed=embed)
 
-    @app_commands.command(name="seed", description="[Admin] Force-reload the Hinduism dataset.")
-    @app_commands.default_permissions(administrator=True)
-    async def seed(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        await db_manager.seed_data()
-        await interaction.followup.send("✅ Database seeded with Hinduism pack.")
-
 # ------------------------------------------------------------------
-# 6. ENTRY POINT
+# 5. ENTRY POINT
 # ------------------------------------------------------------------
 
 async def main():
