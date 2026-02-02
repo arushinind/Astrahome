@@ -37,8 +37,8 @@ REVIEW_CHANNEL_ID = int(os.getenv("REVIEW_CHANNEL_ID", 0))
 # --- EXPERT CONFIGURATION ---
 # Add the Discord User IDs of your experts here.
 EXPERT_IDS = [
-    861825627032125491, 
-    1451038995545850054
+    123456789012345678, 
+    987654321098765432
 ]
 
 STATIC_KNOWLEDGE_BASE = []
@@ -235,10 +235,7 @@ class AdminReviewView(ui.View):
 
     @ui.button(label="Draft Answer", style=discord.ButtonStyle.primary, emoji="✍️", custom_id="qa_btn_answer")
     async def answer_button(self, interaction: discord.Interaction, button: ui.Button):
-        if interaction.user.id not in EXPERT_IDS:
-            await interaction.response.send_message("🚫 **Access Denied:** Only designated Experts can draft answers.", ephemeral=True)
-            return
-
+        # Allow anyone to draft an answer, remove expert check here.
         embed = interaction.message.embeds[0]
         description = embed.description or ""
         question_text = description.replace("**Inquiry:**\n", "").strip()
