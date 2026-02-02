@@ -29,7 +29,7 @@ SUCCESS_COLOR = 0x57F287
 WARNING_COLOR = 0xFEE75C  
 ERROR_COLOR = 0xED4245    
 INFO_COLOR = 0x3498db     
-MYSTIC_COLOR = 0x9b59b6   # Purple for Magic/Oracle
+MYSTIC_COLOR = 0x9b59b6   
 
 DB_NAME = os.getenv("DB_NAME", "astra_home.db")
 REVIEW_CHANNEL_ID = int(os.getenv("REVIEW_CHANNEL_ID", 0))
@@ -72,7 +72,6 @@ class DatabaseManager:
             os.makedirs(directory)
 
         async with aiosqlite.connect(self.db_name) as db:
-            # FAQ Table
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS faq (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -84,7 +83,6 @@ class DatabaseManager:
                     use_count INTEGER DEFAULT 0
                 )
             """)
-            # Users/Karma Table
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id INTEGER PRIMARY KEY,
@@ -96,7 +94,6 @@ class DatabaseManager:
             await db.commit()
         logger.info(f"Connected to Database: {self.db_name}")
 
-    # --- FAQ Logic ---
     async def add_qa(self, question: str, answer: str, author_id: int, approver_id: int):
         async with aiosqlite.connect(self.db_name) as db:
             await db.execute(
@@ -112,32 +109,12 @@ class DatabaseManager:
                 """SELECT question_text, answer_text, id 
                 FROM faq 
                 WHERE question_text LIKE ? OR ? LIKE ('%' || question_text || '%')
-                LIMIT 10""",
+                LIMIT 15""",
                 (f"%{query}%", query)
             )
             rows = await cursor.fetchall()
             return [{'q': r[0], 'a': r[1], 'source': 'db', 'id': r[2]} for r in rows]
 
-    async def get_stats(self):
-        async with aiosqlite.connect(self.db_name) as db:
-            async with db.execute("SELECT COUNT(*) FROM faq") as cursor:
-                db_total = (await cursor.fetchone())[0]
-            async with db.execute("SELECT question_text, use_count FROM faq ORDER BY use_count DESC LIMIT 3") as cursor:
-                top_3 = await cursor.fetchall()
-            return db_total, top_3
-
-    async def get_leaderboard(self):
-        async with aiosqlite.connect(self.db_name) as db:
-            async with db.execute("""
-                SELECT approver_id, COUNT(*) as score 
-                FROM faq 
-                WHERE approver_id != 0 
-                GROUP BY approver_id 
-                ORDER BY score DESC LIMIT 5
-            """) as cursor:
-                return await cursor.fetchall()
-
-    # --- Karma/User Logic ---
     async def update_karma(self, user_id: int, points: int):
         async with aiosqlite.connect(self.db_name) as db:
             await db.execute("""
@@ -149,7 +126,6 @@ class DatabaseManager:
     async def record_meditation(self, user_id: int):
         now = datetime.now()
         async with aiosqlite.connect(self.db_name) as db:
-            # Check cooldown (1 hour)
             async with db.execute("SELECT last_meditation FROM users WHERE user_id = ?", (user_id,)) as cursor:
                 row = await cursor.fetchone()
                 if row and row[0]:
@@ -157,7 +133,6 @@ class DatabaseManager:
                     if now - last < timedelta(hours=1):
                         return False, (timedelta(hours=1) - (now - last))
 
-            # Update stats
             await db.execute("""
                 INSERT INTO users (user_id, karma, meditations, last_meditation) 
                 VALUES (?, 10, 1, ?)
@@ -182,12 +157,11 @@ db_manager = DatabaseManager(DB_NAME)
 
 class QuizButton(ui.Button):
     def __init__(self, label, is_correct, quiz_view):
-        super().__init__(style=discord.ButtonStyle.secondary, label=label[:80]) # Limit length
+        super().__init__(style=discord.ButtonStyle.secondary, label=label[:80])
         self.is_correct = is_correct
         self.quiz_view = quiz_view
 
     async def callback(self, interaction: discord.Interaction):
-        # Disable all buttons
         for child in self.view.children:
             child.disabled = True
             if isinstance(child, QuizButton):
@@ -201,19 +175,15 @@ class QuizButton(ui.Button):
             await interaction.response.edit_message(content="🎉 **Correct!** +5 Karma", view=self.view)
         else:
             await interaction.response.edit_message(content=f"❌ **Wrong!** The correct answer was highlighted.", view=self.view)
-        
         self.view.stop()
 
 class QuizView(ui.View):
     def __init__(self, correct_answer, wrong_answers):
         super().__init__(timeout=30)
-        
-        # Combine and shuffle
         options = [(correct_answer, True)]
         for ans in wrong_answers:
             options.append((ans, False))
         random.shuffle(options)
-
         for label, is_correct in options:
             self.add_item(QuizButton(label, is_correct, self))
 
@@ -270,7 +240,6 @@ class ApprovalView(ui.View):
         question_text = embed.description.split("\n\n**Proposed Answer:**")[0].replace("**Inquiry:** ", "").strip()
         
         await db_manager.add_qa(question_text, self.answer_text, user_id, interaction.user.id)
-        # Give admin karma
         await db_manager.update_karma(interaction.user.id, 15)
 
         target_channel = interaction.guild.get_channel(channel_id)
@@ -293,28 +262,124 @@ class ApprovalView(ui.View):
         await interaction.response.send_message("↩️ Ticket rejected.", ephemeral=True)
 
 # ------------------------------------------------------------------
-# 5. DISAMBIGUATION
+# 5. DISAMBIGUATION & SUBMISSION LOGIC
 # ------------------------------------------------------------------
 
 class DisambiguationSelect(ui.Select):
-    def __init__(self, candidates):
+    def __init__(self, candidates, bot, user, original_question):
         self.candidates = candidates
+        self.bot = bot
+        self.user = user
+        self.original_question = original_question
+        
         options = []
-        for i, c in enumerate(candidates[:25]):
-            label = c['q'][:95] + "..." if len(c['q']) > 95 else c['q']
+        # Add actual candidates
+        for i, c in enumerate(candidates[:24]): # Limit to 24 to leave room for the special option
+            label = c['q'][:90] + "..." if len(c['q']) > 90 else c['q']
             options.append(discord.SelectOption(label=label, value=str(i), emoji="🕉️"))
-        super().__init__(placeholder="Select the correct question:", options=options)
+            
+        # Add the "Send to Experts" option
+        options.append(discord.SelectOption(
+            label="None of these / Send to Experts", 
+            value="EXP_REQ", 
+            description="Forward this question to admin review", 
+            emoji="📨"
+        ))
+        
+        super().__init__(placeholder="Select the correct question OR ask Experts:", options=options)
 
     async def callback(self, interaction: discord.Interaction):
-        selection = self.candidates[int(self.values[0])]
-        embed = discord.Embed(title="🕉️ Knowledge Base", description=selection['a'], color=SUCCESS_COLOR)
-        embed.add_field(name="Topic", value=selection['q'])
-        await interaction.response.edit_message(embed=embed, view=None)
+        # Security check
+        if interaction.user.id != self.user.id:
+            await interaction.response.send_message("This menu is not for you.", ephemeral=True)
+            return
+
+        if self.values[0] == "EXP_REQ":
+            # Handle "Send to Experts" selection
+            review_channel = self.bot.get_channel(REVIEW_CHANNEL_ID)
+            if not review_channel:
+                await interaction.response.send_message("⚠️ System Error: Review channel unavailable.", ephemeral=True)
+                return
+
+            embed = discord.Embed(
+                title="📨 New Question Received",
+                description=f"**Inquiry:**\n{self.original_question}",
+                color=BRAND_COLOR,
+                timestamp=discord.utils.utcnow()
+            )
+            embed.set_author(name=f"{self.user.display_name}", icon_url=self.user.display_avatar.url)
+            embed.add_field(name="User ID", value=str(self.user.id), inline=True)
+            embed.add_field(name="Channel ID", value=str(interaction.channel_id), inline=True)
+            embed.set_footer(text="Awaiting Expert Answer")
+
+            await review_channel.send(embed=embed, view=AdminReviewView())
+            
+            confirm_embed = discord.Embed(
+                description=f"✅ **Sent!** Your question has been forwarded to the **Astra Home Experts**.",
+                color=SUCCESS_COLOR
+            )
+            await interaction.response.edit_message(embed=confirm_embed, view=None)
+
+        else:
+            # Handle standard selection
+            selection = self.candidates[int(self.values[0])]
+            embed = discord.Embed(title="🕉️ Knowledge Base", description=selection['a'], color=SUCCESS_COLOR)
+            embed.add_field(name="Topic", value=selection['q'])
+            await interaction.response.edit_message(embed=embed, view=None)
 
 class DisambiguationView(ui.View):
-    def __init__(self, candidates):
+    def __init__(self, candidates, bot, user, original_question):
         super().__init__(timeout=60)
-        self.add_item(DisambiguationSelect(candidates))
+        self.add_item(DisambiguationSelect(candidates, bot, user, original_question))
+
+class ConfirmSubmissionView(ui.View):
+    """View to ask user if they want to submit to experts when no match is found."""
+    def __init__(self, bot, question, user):
+        super().__init__(timeout=60)
+        self.bot = bot
+        self.question = question
+        self.user = user
+
+    @ui.button(label="Send to Experts", style=discord.ButtonStyle.primary, emoji="📨")
+    async def confirm(self, interaction: discord.Interaction, button: ui.Button):
+        if interaction.user.id != self.user.id:
+            await interaction.response.send_message("This action is not for you.", ephemeral=True)
+            return
+        
+        button.disabled = True
+        await interaction.response.edit_message(view=self)
+
+        review_channel = self.bot.get_channel(REVIEW_CHANNEL_ID)
+        if not review_channel:
+            await interaction.followup.send("⚠️ System Error: Review channel unavailable.", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title="📨 New Question Received",
+            description=f"**Inquiry:**\n{self.question}",
+            color=BRAND_COLOR,
+            timestamp=discord.utils.utcnow()
+        )
+        embed.set_author(name=f"{self.user.display_name}", icon_url=self.user.display_avatar.url)
+        embed.add_field(name="User ID", value=str(self.user.id), inline=True)
+        embed.add_field(name="Channel ID", value=str(interaction.channel_id), inline=True)
+        embed.set_footer(text="Awaiting Expert Answer")
+
+        await review_channel.send(embed=embed, view=AdminReviewView())
+        
+        confirm_embed = discord.Embed(
+            description=f"✅ **Sent!** Your question has been forwarded to the **Astra Home Experts**.",
+            color=SUCCESS_COLOR
+        )
+        await interaction.followup.send(embed=confirm_embed, ephemeral=True)
+
+    @ui.button(label="Cancel", style=discord.ButtonStyle.secondary, emoji="❌")
+    async def cancel(self, interaction: discord.Interaction, button: ui.Button):
+        if interaction.user.id != self.user.id:
+            await interaction.response.send_message("This action is not for you.", ephemeral=True)
+            return
+        await interaction.response.edit_message(content="❌ Request cancelled.", embed=None, view=None)
+        self.stop()
 
 # ------------------------------------------------------------------
 # 6. BOT COMMANDS
@@ -342,9 +407,29 @@ class QACog(commands.Cog):
         self.bot = bot
 
     def calculate_match_score(self, query: str, target: str) -> float:
-        query_l, target_l = query.lower(), target.lower()
-        if query_l in target_l: return 1.0
-        return difflib.SequenceMatcher(None, query_l, target_l).ratio()
+        # Stopwords to clean up matching (prevents "Who is X" matching "Who is Y" just because of "Who is")
+        stopwords = {'who', 'what', 'where', 'when', 'why', 'how', 'is', 'are', 'the', 'a', 'an', 'in', 'of', 'for', 'to', 'do', 'does', 'did'}
+        
+        def clean_text(text):
+            # Convert to lower, remove punctuation, remove stopwords
+            words = ''.join(c for c in text.lower() if c.isalnum() or c.isspace()).split()
+            cleaned = [w for w in words if w not in stopwords]
+            return " ".join(cleaned)
+
+        query_clean = clean_text(query)
+        target_clean = clean_text(target)
+
+        # If query is empty after cleaning (e.g. "Who is?"), fallback to raw
+        if not query_clean:
+            query_clean = query.lower()
+            target_clean = target.lower()
+
+        # 1. Exact Substring Match on CLEANED TEXT
+        if query_clean and query_clean in target_clean:
+            return 0.95
+        
+        # 2. Fuzzy Match on CLEANED TEXT
+        return difflib.SequenceMatcher(None, query_clean, target_clean).ratio()
 
     @app_commands.command(name="ask", description="Ask a question. Fuzzy matching included.")
     async def ask(self, interaction: discord.Interaction, question: str):
@@ -354,14 +439,16 @@ class QACog(commands.Cog):
         # Search Static
         for entry in STATIC_KNOWLEDGE_BASE:
             score = self.calculate_match_score(question, entry['q'])
-            if score > 0.4:
+            # Increased threshold to 0.6 to prevent garbage matches
+            if score > 0.6: 
                 candidates.append({'q': entry['q'], 'a': entry['a'], 'score': score, 'source': 'static'})
 
         # Search DB
         db_rows = await db_manager.search_candidates(question)
         for row in db_rows:
             score = self.calculate_match_score(question, row['q'])
-            candidates.append({'q': row['q'], 'a': row['a'], 'score': score, 'source': 'db'})
+            if score > 0.6:
+                candidates.append({'q': row['q'], 'a': row['a'], 'score': score, 'source': 'db'})
 
         candidates.sort(key=lambda x: x['score'], reverse=True)
         # Dedupe
@@ -375,30 +462,29 @@ class QACog(commands.Cog):
         candidates = unique
 
         if not candidates:
-            # Fallback to Admin
-            review_channel = self.bot.get_channel(REVIEW_CHANNEL_ID)
-            if not review_channel:
-                await interaction.followup.send("⚠️ No match found & Review channel missing.", ephemeral=True)
-                return
+            # No match found -> Ask user if they want to forward to admin
+            embed = discord.Embed(
+                title="🤔 No Answer Found",
+                description="I couldn't find a matching answer in the scriptures. Would you like to send this question to our **Experts**?",
+                color=WARNING_COLOR
+            )
+            view = ConfirmSubmissionView(self.bot, question, interaction.user)
+            await interaction.followup.send(embed=embed, view=view)
 
-            embed = discord.Embed(title="📨 New Question", description=f"**Inquiry:**\n{question}", color=BRAND_COLOR)
-            embed.add_field(name="User ID", value=str(interaction.user.id))
-            embed.add_field(name="Channel ID", value=str(interaction.channel_id))
-            await review_channel.send(embed=embed, view=AdminReviewView())
-            await interaction.followup.send("✅ Sent to experts for review.")
-
-        elif len(candidates) == 1 or (candidates[0]['score'] > 0.95):
+        elif len(candidates) == 1 and candidates[0]['score'] > 0.95:
+            # Only exact match auto-responds
             best = candidates[0]
             embed = discord.Embed(title="🕉️ Knowledge Base", description=best['a'], color=SUCCESS_COLOR)
             embed.add_field(name="Topic", value=best['q'])
             await interaction.followup.send(embed=embed)
         else:
+            # Multiple matches OR low-confidence match -> Show dropdown with Expert option
             await interaction.followup.send(
-                embed=discord.Embed(title="🔍 Multiple Matches", description="Select the best fit:", color=INFO_COLOR),
-                view=DisambiguationView(candidates)
+                embed=discord.Embed(title="🔍 I found potential matches", description="Select the correct question, or send yours to the experts:", color=INFO_COLOR),
+                view=DisambiguationView(candidates, self.bot, interaction.user, question)
             )
 
-    # --- CRAZY NEW FEATURES (STRICTLY THEMED) ---
+    # --- CRAZY NEW FEATURES ---
 
     @app_commands.command(name="quiz", description="Test your Vedic knowledge and earn Karma!")
     async def quiz(self, interaction: discord.Interaction):
@@ -408,23 +494,15 @@ class QACog(commands.Cog):
 
         question_data = random.choice(STATIC_KNOWLEDGE_BASE)
         correct_answer = question_data['a']
-        
-        # Get 3 random wrong answers
         distractors = random.sample([x['a'] for x in STATIC_KNOWLEDGE_BASE if x['q'] != question_data['q']], 3)
         
-        embed = discord.Embed(
-            title="🧠 Astra Wisdom Quiz",
-            description=f"**Question:** {question_data['q']}",
-            color=MYSTIC_COLOR
-        )
+        embed = discord.Embed(title="🧠 Astra Wisdom Quiz", description=f"**Question:** {question_data['q']}", color=MYSTIC_COLOR)
         embed.set_footer(text="Select the correct answer below. (+5 Karma)")
-        
         await interaction.response.send_message(embed=embed, view=QuizView(correct_answer, distractors))
 
     @app_commands.command(name="meditate", description="Perform a Dhyana (Meditation) session.")
     async def meditate(self, interaction: discord.Interaction):
         success, wait_time = await db_manager.record_meditation(interaction.user.id)
-        
         if not success:
             mins = int(wait_time.total_seconds() // 60)
             await interaction.response.send_message(f"🧘 You must rest. You can meditate again in {mins} minutes.", ephemeral=True)
@@ -433,7 +511,6 @@ class QACog(commands.Cog):
         msg = await interaction.response.send_message("🧘 **Entering Asana...** (Posture)", ephemeral=False)
         msg = await interaction.original_response()
         
-        # Sanskrit/Vedic Stages
         stages = [
             "🌬️ **Pranayama...** (Controlling breath) [==........]",
             "👁️ **Pratyahara...** (Withdrawing senses) [====......]",
@@ -446,13 +523,10 @@ class QACog(commands.Cog):
             await asyncio.sleep(1.5)
             await msg.edit(content=stage)
         
-        # Strictly Scriptural Quotes
         quotes = [
             "“You have a right to perform your prescribed duties, but you are not entitled to the fruits of your actions.” – *Bhagavad Gita 2.47*",
             "“Yoga is the journey of the self, through the self, to the self.” – *Bhagavad Gita 6.20*",
-            "“As a lamp in a windless place does not flicker, so is the disciplined mind of a yogi practicing meditation.” – *Bhagavad Gita 6.19*",
-            "“Lead me from the unreal to the real, lead me from darkness to light, lead me from death to immortality.” – *Brihadaranyaka Upanishad*",
-            "“The little space within the heart is as great as the vast universe.” – *Chandogya Upanishad*"
+            "“As a lamp in a windless place does not flicker, so is the disciplined mind of a yogi practicing meditation.” – *Bhagavad Gita 6.19*"
         ]
         
         final_embed = discord.Embed(title="🙏 Shanti (Peace)", description=random.choice(quotes), color=SUCCESS_COLOR)
@@ -462,12 +536,8 @@ class QACog(commands.Cog):
     @app_commands.command(name="profile", description="Check your spiritual standing.")
     async def profile(self, interaction: discord.Interaction):
         row = await db_manager.get_user_profile(interaction.user.id)
-        if not row:
-            karma, meditations = 0, 0
-        else:
-            karma, meditations = row
+        karma, meditations = row if row else (0, 0)
 
-        # Thematic Ranks
         if karma < 50: rank = "Sadhaka (Aspirant)"
         elif karma < 150: rank = "Brahmachari (Student)"
         elif karma < 300: rank = "Yogi (Practitioner)"
@@ -479,26 +549,20 @@ class QACog(commands.Cog):
         embed.add_field(name="Dharma Rank", value=f"**{rank}**", inline=False)
         embed.add_field(name="🌀 Karma", value=str(karma), inline=True)
         embed.add_field(name="🧘 Dhyana Sessions", value=str(meditations), inline=True)
-        
         await interaction.response.send_message(embed=embed)
 
     @app_commands.command(name="oracle", description="Seek guidance from the Shastras.")
     async def oracle(self, interaction: discord.Interaction, query: str):
-        # Strictly Dharmic responses
         responses = [
             "This path aligns with your Dharma.",
             "Obstacles (Vighna) are present; perform selfless service (Seva) first.",
             "The outcome depends on your past Karma.",
             "Meditate on this; the answer lies within the Atman.",
-            "Detach from the result, focus only on the action (Karma Yoga).",
-            "Time (Kala) is the ultimate decider.",
-            "Sattva Guna (purity) is required for success here."
+            "Detach from the result, focus only on the action (Karma Yoga)."
         ]
-        
         embed = discord.Embed(title="📜 Vedic Guidance", color=MYSTIC_COLOR)
         embed.add_field(name="Inquiry", value=query, inline=False)
         embed.add_field(name="Insight", value=f"||{random.choice(responses)}||", inline=False)
-        
         await interaction.response.send_message(embed=embed)
 
 async def main():
