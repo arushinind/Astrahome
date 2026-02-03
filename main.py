@@ -4,7 +4,7 @@ from discord.ext import commands, tasks
 import logging
 import os
 import asyncio
-import aiosqlite
+import asyncpg  # PostgreSQL Driver
 import json
 import difflib
 import random
@@ -31,14 +31,16 @@ ERROR_COLOR = 0xED4245
 INFO_COLOR = 0x3498db     
 MYSTIC_COLOR = 0x9b59b6   
 
-DB_NAME = os.getenv("DB_NAME", "astra_home.db")
+# Railway/Env Configuration
+DATABASE_URL = os.getenv("DATABASE_URL")
 REVIEW_CHANNEL_ID = int(os.getenv("REVIEW_CHANNEL_ID", 0))
 
 # --- EXPERT CONFIGURATION ---
 # Add the Discord User IDs of your experts here.
+# Only these users can Publish/Approve/Reject answers.
 EXPERT_IDS = [
-    1467844647773802579, 
-    861825627032125491
+    123456789012345678, 
+    987654321098765432
 ]
 
 STATIC_KNOWLEDGE_BASE = []
@@ -66,128 +68,121 @@ def load_knowledge_base():
         logger.error(f"❌ Failed to load Knowledge Base: {e}")
 
 # ------------------------------------------------------------------
-# 2. DATABASE MANAGER
+# 2. DATABASE MANAGER (POSTGRESQL)
 # ------------------------------------------------------------------
 
 class DatabaseManager:
-    def __init__(self, db_name: str):
-        self.db_name = db_name
+    def __init__(self, db_url: str):
+        self.db_url = db_url
+        self.pool = None
 
     async def initialize(self):
-        directory = os.path.dirname(self.db_name)
-        if directory and not os.path.exists(directory):
-            os.makedirs(directory)
+        if not self.db_url:
+            logger.critical("❌ DATABASE_URL is missing! Bot cannot connect to Postgres.")
+            return
 
-        async with aiosqlite.connect(self.db_name) as db:
-            # FAQ Table
-            await db.execute("""
+        # Create connection pool
+        try:
+            self.pool = await asyncpg.create_pool(self.db_url)
+        except Exception as e:
+            logger.critical(f"❌ Failed to connect to Postgres: {e}")
+            return
+
+        # Create Tables
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS faq (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id SERIAL PRIMARY KEY,
                     question_text TEXT NOT NULL,
                     answer_text TEXT NOT NULL,
-                    author_id INTEGER,
-                    approver_id INTEGER,
+                    author_id BIGINT,
+                    approver_id BIGINT,
                     created_at TIMESTAMP,
                     use_count INTEGER DEFAULT 0
-                )
-            """)
-            # Users Table (Updated with last_daily)
-            await db.execute("""
+                );
+                
+                CREATE INDEX IF NOT EXISTS idx_question ON faq(question_text);
+
                 CREATE TABLE IF NOT EXISTS users (
-                    user_id INTEGER PRIMARY KEY,
+                    user_id BIGINT PRIMARY KEY,
                     karma INTEGER DEFAULT 0,
                     meditations INTEGER DEFAULT 0,
                     last_meditation TIMESTAMP,
                     last_daily TIMESTAMP
-                )
+                );
             """)
-            
-            # MIGRATION CHECK: Attempt to add columns if they don't exist (for older DB versions)
-            try:
-                await db.execute("ALTER TABLE users ADD COLUMN last_daily TIMESTAMP")
-            except Exception:
-                pass # Column likely exists
-                
-            await db.commit()
-        logger.info(f"Connected to Database: {self.db_name}")
+        logger.info("✅ Connected to PostgreSQL Database")
 
     async def add_qa(self, question: str, answer: str, author_id: int, approver_id: int):
-        async with aiosqlite.connect(self.db_name) as db:
-            await db.execute(
+        async with self.pool.acquire() as conn:
+            await conn.execute(
                 """INSERT INTO faq (question_text, answer_text, author_id, approver_id, created_at)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (question, answer, author_id, approver_id, datetime.now())
+                   VALUES ($1, $2, $3, $4, $5)""",
+                question, answer, author_id, approver_id, datetime.now()
             )
-            await db.commit()
 
     async def search_candidates(self, query: str):
-        async with aiosqlite.connect(self.db_name) as db:
-            cursor = await db.execute(
+        async with self.pool.acquire() as conn:
+            # ILIKE for case-insensitive search
+            rows = await conn.fetch(
                 """SELECT question_text, answer_text, id 
                 FROM faq 
-                WHERE question_text LIKE ? OR ? LIKE ('%' || question_text || '%')
+                WHERE question_text ILIKE $1 OR $1 ILIKE ('%' || question_text || '%')
                 LIMIT 15""",
-                (f"%{query}%", query)
+                f"%{query}%"
             )
-            rows = await cursor.fetchall()
-            return [{'q': r[0], 'a': r[1], 'source': 'db', 'id': r[2]} for r in rows]
+            return [{'q': r['question_text'], 'a': r['answer_text'], 'source': 'db', 'id': r['id']} for r in rows]
 
     async def update_karma(self, user_id: int, points: int):
-        async with aiosqlite.connect(self.db_name) as db:
-            await db.execute("""
-                INSERT INTO users (user_id, karma) VALUES (?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET karma = karma + ?
-            """, (user_id, points, points))
-            await db.commit()
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO users (user_id, karma) VALUES ($1, $2)
+                ON CONFLICT (user_id) DO UPDATE SET karma = users.karma + $2
+            """, user_id, points)
 
     async def record_meditation(self, user_id: int):
         now = datetime.now()
-        async with aiosqlite.connect(self.db_name) as db:
-            async with db.execute("SELECT last_meditation FROM users WHERE user_id = ?", (user_id,)) as cursor:
-                row = await cursor.fetchone()
-                if row and row[0]:
-                    last = datetime.fromisoformat(row[0])
-                    if now - last < timedelta(hours=1):
-                        return False, (timedelta(hours=1) - (now - last))
+        async with self.pool.acquire() as conn:
+            val = await conn.fetchval("SELECT last_meditation FROM users WHERE user_id = $1", user_id)
+            
+            if val:
+                if now - val < timedelta(hours=1):
+                    return False, (timedelta(hours=1) - (now - val))
 
-            await db.execute("""
+            await conn.execute("""
                 INSERT INTO users (user_id, karma, meditations, last_meditation) 
-                VALUES (?, 10, 1, ?)
-                ON CONFLICT(user_id) DO UPDATE SET 
-                    karma = karma + 10, 
-                    meditations = meditations + 1,
-                    last_meditation = ?
-            """, (user_id, now, now))
-            await db.commit()
+                VALUES ($1, 10, 1, $2)
+                ON CONFLICT (user_id) DO UPDATE SET 
+                    karma = users.karma + 10, 
+                    meditations = users.meditations + 1,
+                    last_meditation = $2
+            """, user_id, now)
             return True, None
 
     async def claim_daily(self, user_id: int):
         now = datetime.now()
-        async with aiosqlite.connect(self.db_name) as db:
-            async with db.execute("SELECT last_daily FROM users WHERE user_id = ?", (user_id,)) as cursor:
-                row = await cursor.fetchone()
-                if row and row[0]:
-                    last = datetime.fromisoformat(row[0])
-                    if now - last < timedelta(hours=24):
-                        return False, (timedelta(hours=24) - (now - last))
+        async with self.pool.acquire() as conn:
+            val = await conn.fetchval("SELECT last_daily FROM users WHERE user_id = $1", user_id)
             
-            # Give 50 Karma for daily
-            await db.execute("""
+            if val:
+                if now - val < timedelta(hours=24):
+                    return False, (timedelta(hours=24) - (now - val))
+            
+            await conn.execute("""
                 INSERT INTO users (user_id, karma, last_daily) 
-                VALUES (?, 50, ?)
-                ON CONFLICT(user_id) DO UPDATE SET 
-                    karma = karma + 50, 
-                    last_daily = ?
-            """, (user_id, now, now))
-            await db.commit()
+                VALUES ($1, 50, $2)
+                ON CONFLICT (user_id) DO UPDATE SET 
+                    karma = users.karma + 50, 
+                    last_daily = $2
+            """, user_id, now)
             return True, None
 
     async def get_user_profile(self, user_id: int):
-        async with aiosqlite.connect(self.db_name) as db:
-            async with db.execute("SELECT karma, meditations FROM users WHERE user_id = ?", (user_id,)) as cursor:
-                return await cursor.fetchone()
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow("SELECT karma, meditations FROM users WHERE user_id = $1", user_id)
 
-db_manager = DatabaseManager(DB_NAME)
+# Initialize
+db_manager = DatabaseManager(DATABASE_URL)
 
 # ------------------------------------------------------------------
 # 3. QUIZ & GAME COMPONENTS
@@ -235,7 +230,7 @@ class AdminReviewView(ui.View):
 
     @ui.button(label="Draft Answer", style=discord.ButtonStyle.primary, emoji="✍️", custom_id="qa_btn_answer")
     async def answer_button(self, interaction: discord.Interaction, button: ui.Button):
-        # Allow anyone to draft an answer, remove expert check here.
+        # Open to EVERYONE (as requested)
         embed = interaction.message.embeds[0]
         description = embed.description or ""
         question_text = description.replace("**Inquiry:**\n", "").strip()
@@ -243,6 +238,7 @@ class AdminReviewView(ui.View):
 
     @ui.button(label="Discard", style=discord.ButtonStyle.secondary, emoji="🗑️", custom_id="qa_btn_delete")
     async def delete_button(self, interaction: discord.Interaction, button: ui.Button):
+        # Restricted to EXPERTS
         if interaction.user.id not in EXPERT_IDS:
             await interaction.response.send_message("🚫 **Access Denied:** Only designated Experts can discard tickets.", ephemeral=True)
             return
@@ -277,6 +273,7 @@ class ApprovalView(ui.View):
 
     @ui.button(label="Publish Publicly", style=discord.ButtonStyle.success, emoji="📢", custom_id="qa_btn_approve")
     async def approve(self, interaction: discord.Interaction, button: ui.Button):
+        # Restricted to EXPERTS
         if interaction.user.id not in EXPERT_IDS:
             await interaction.response.send_message("🚫 **Access Denied:** Only designated Experts can publish answers.", ephemeral=True)
             return
@@ -289,6 +286,7 @@ class ApprovalView(ui.View):
         await db_manager.add_qa(question_text, self.answer_text, user_id, interaction.user.id)
         await db_manager.update_karma(interaction.user.id, 15)
 
+        # Cross-Server Messaging Logic
         target_channel = interaction.client.get_channel(channel_id)
         
         if target_channel:
@@ -312,6 +310,7 @@ class ApprovalView(ui.View):
 
     @ui.button(label="Reject", style=discord.ButtonStyle.danger, emoji="❌", custom_id="qa_btn_reject")
     async def reject(self, interaction: discord.Interaction, button: ui.Button):
+        # Restricted to EXPERTS
         if interaction.user.id not in EXPERT_IDS:
             await interaction.response.send_message("🚫 **Access Denied.**", ephemeral=True)
             return
@@ -453,7 +452,7 @@ class AstraHomeBot(commands.Bot):
         await db_manager.initialize()
         await self.add_cog(QACog(self))
         await self.tree.sync()
-        self.rotate_status.start() # Start Status Loop
+        self.rotate_status.start()
 
     @tasks.loop(minutes=10)
     async def rotate_status(self):
@@ -538,8 +537,6 @@ class QACog(commands.Cog):
                 embed=discord.Embed(title="🔍 I found potential matches", description="Select the correct question, or send yours to the experts:", color=INFO_COLOR),
                 view=DisambiguationView(candidates, self.bot, interaction.user, question)
             )
-
-    # --- ENHANCED FEATURES ---
 
     @app_commands.command(name="daily", description="Claim your daily Karma reward (Every 24h).")
     async def daily(self, interaction: discord.Interaction):
@@ -658,5 +655,3 @@ async def main():
 if __name__ == "__main__":
     try: asyncio.run(main())
     except KeyboardInterrupt: pass
-
-
